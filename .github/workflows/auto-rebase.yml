@@ -1,0 +1,53 @@
+name: Auto-rebase queued PRs
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  rebase:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Get queued PR branches
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api graphql -f query='
+            query {
+              repository(owner: "${{ github.repository_owner }}", name: "${{ github.event.repository.name }}") {
+                mergeQueue {
+                  entries(first: 50) {
+                    nodes { pullRequest { headRefName } }
+                  }
+                }
+              }
+            }' --jq '.data.repository.mergeQueue.entries.nodes[].pullRequest.headRefName' > queued_branches.txt
+          cat queued_branches.txt
+
+      - name: Rebase queued PR branches onto main
+        run: |
+          while read -r branch; do
+            [ -z "$branch" ] && continue
+            echo "Rebasing $branch onto main"
+            git fetch origin "$branch"
+            git checkout -B "$branch" "origin/$branch"
+            if git rebase origin/main; then
+              git push --force-with-lease origin "$branch"
+              echo "$branch: rebase OK, pushed"
+            else
+              git rebase --abort
+              echo "$branch: conflict, rebase aborted"
+            fi
+          done < queued_branches.txt
