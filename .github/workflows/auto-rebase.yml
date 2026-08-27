@@ -1,4 +1,4 @@
-name: Auto-rebase queued PRs
+name: Rebuild queue with a real rebase of the next entry
 on:
   push:
     branches: [main]
@@ -20,34 +20,70 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Get queued PR branches
+      - name: Get queue snapshot, ordered by position
         env:
           GH_TOKEN: ${{ github.token }}
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
         run: |
           gh api graphql -f query='
-            query {
-              repository(owner: "${{ github.repository_owner }}", name: "${{ github.event.repository.name }}") {
+            query($owner: String!, $repo: String!) {
+              repository(owner: $owner, name: $repo) {
                 mergeQueue {
                   entries(first: 50) {
-                    nodes { pullRequest { headRefName } }
+                    nodes {
+                      position
+                      pullRequest { id number headRefName }
+                    }
                   }
                 }
               }
-            }' --jq '.data.repository.mergeQueue.entries.nodes[].pullRequest.headRefName' > queued_branches.txt
-          cat queued_branches.txt
+            }' -F owner="$OWNER" -F repo="$REPO" \
+            --jq '.data.repository.mergeQueue.entries.nodes | sort_by(.position)' > ordered.json
+          echo "Queue snapshot:"
+          cat ordered.json
 
-      - name: Rebase queued PR branches onto main
+      - name: Dequeue every entry currently in the queue
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          while read -r branch; do
-            [ -z "$branch" ] && continue
-            echo "Rebasing $branch onto main"
-            git fetch origin "$branch"
-            git checkout -B "$branch" "origin/$branch"
-            if git rebase origin/main; then
-              git push --force-with-lease origin "$branch"
-              echo "$branch: rebase OK, pushed"
+          jq -c '.[]' ordered.json | while read -r entry; do
+            PR_ID=$(echo "$entry" | jq -r '.pullRequest.id')
+            PR_NUM=$(echo "$entry" | jq -r '.pullRequest.number')
+            echo "Dequeuing PR #$PR_NUM"
+            gh api graphql -f query='mutation($id: ID!) { dequeuePullRequest(input: {id: $id}) { clientMutationId } }' -F id="$PR_ID"
+          done
+
+      - name: Real rebase of the front entry only
+        run: |
+          COUNT=$(jq 'length' ordered.json)
+          if [ "$COUNT" -eq 0 ]; then
+            echo "Queue was empty, nothing to rebase"
+            exit 0
+          fi
+
+          FIRST_BRANCH=$(jq -r '.[0].pullRequest.headRefName' ordered.json)
+          echo "Rebasing $FIRST_BRANCH onto main for real"
+          git fetch origin "$FIRST_BRANCH"
+          git checkout -B "$FIRST_BRANCH" "origin/$FIRST_BRANCH"
+          if git rebase origin/main; then
+            if git push --force-with-lease origin "$FIRST_BRANCH"; then
+              echo "$FIRST_BRANCH: rebase OK, pushed"
             else
-              git rebase --abort
-              echo "$branch: conflict, rebase aborted"
+              echo "$FIRST_BRANCH: rebase OK locally, but push rejected"
             fi
-          done < queued_branches.txt
+          else
+            git rebase --abort
+            echo "$FIRST_BRANCH: conflict, rebase aborted"
+          fi
+
+      - name: Re-enqueue every PR, in its original order
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          jq -c '.[]' ordered.json | while read -r entry; do
+            PR_ID=$(echo "$entry" | jq -r '.pullRequest.id')
+            PR_NUM=$(echo "$entry" | jq -r '.pullRequest.number')
+            echo "Re-enqueuing PR #$PR_NUM"
+            gh api graphql -f query='mutation($id: ID!) { enqueuePullRequest(input: {pullRequestId: $id}) { clientMutationId } }' -F id="$PR_ID"
+          done
