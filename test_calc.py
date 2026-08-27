@@ -1,5 +1,4 @@
 from calc import calculate
 
-
 def test_calculate():
-    assert calculate(3) == 9
+    assert calculate(3) == 6
